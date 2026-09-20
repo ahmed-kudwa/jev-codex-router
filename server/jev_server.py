@@ -8,10 +8,11 @@ Router's local caller edge (native session sharing enabled) — with no format
 conversion: Responses in, Responses out, SSE relayed verbatim.
 
 Default routing policy:
-  luna  → always max thinking + priority speed (the 2x cost is negligible)
-  sol   → adaptive thinking depth (Jev) + standard speed
-  astra → adaptive thinking depth (Jev) + standard speed
-  conf < 0.5 → HOLD: middle tier (sol) — anti-downgrade without burning the
+  Jev chooses from every installed native gpt-* model plus the installed
+  opencode-go/deepseek-* models. The Router catalog is read at request time,
+  so model availability follows the local Router instead of a hard-coded list.
+  Thinking depth is adapted to the selected model's supported effort levels.
+  conf < 0.5 → HOLD: the native middle tier (sol) — anti-downgrade without burning the
   frontier (backtest-calibrated: −12% → −60% vs full-Astra) — with ONE
   measured exception: a clean mechanical continuation (tool step, no error,
   shallow depth) that Jev itself wanted on luna keeps luna on the fast lane.
@@ -44,8 +45,7 @@ Log: ~/.codex/codex-router/jev-router-live.jsonl
 Codex-dry tandem: when native usage is exhausted — a manual flag file
 (~/.codex/codex-router/jev-router.codex-dry) or an observed quota failure
 (429 / usage-limit body) — the triptych is replaced until the window resets:
-frontier-tier (astra) calls go to GLM (opencode-go/glm-5.3-flash), every
-other tier to deepseek (opencode-go/deepseek-v4.1-flash). A quota failure
+  native calls go to OpenCode DeepSeek (opencode-go/deepseek-v4.1-flash). A quota failure
 flips the state and retries the same call on the tandem; a successful native
 call clears an auto state (never the manual flag).
 """
@@ -54,14 +54,34 @@ import http.client
 import json
 import os
 import re
+import shutil
 import threading
 import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from hive_classifier import classify as hive_classify
+from hive_classifier import cache_get as hive_cache_get
+from hive_classifier import cache_invalidate as hive_cache_invalidate
+from hive_classifier import cache_key as hive_cache_key
+from hive_classifier import cache_put as hive_cache_put
+from hive_classifier import cache_snapshot as hive_cache_snapshot
+from hive_classifier import decision_context as hive_decision_context
+from hive_classifier import enrich_decision as hive_enrich_decision
+from hive_classifier import maintenance as hive_maintenance
+from hive_classifier import maintenance_snapshot as hive_maintenance_snapshot
+from hive_classifier import record_outcome as hive_record_outcome
+from hive_classifier import snapshot as hive_snapshot
+from hive_logistic import snapshot as hive_logistic_snapshot
+
 HOME = os.path.expanduser("~")
 STATE = os.path.join(HOME, ".codex", "codex-router")
 ENV_PATH = os.path.join(HOME, ".hermes", ".env")
+CATALOG_PATH = os.path.join(STATE, "merged-models.json")
+AGING_PATH = os.path.join(STATE, "tool-result-aging.json")
+USAGE_EVENTS_PATH = os.path.join(STATE, "usage-events.jsonl")
+GUIDANCE_STATUS_PATH = os.path.join(HOME, ".codex", "instruction-sync", "status.json")
+GUIDANCE_CONFIG_PATH = os.path.join(HOME, ".codex", "instruction-sync", "config.json")
 CALLER_SECRET_PATH = os.path.join(STATE, "caller-secret")
 OFF_PATH = os.path.join(STATE, "jev-router.off")
 SHADOW_PATH = os.path.join(STATE, "jev-router.shadow")
@@ -78,18 +98,28 @@ API = "https://api.typesafe.ai/v1/systemone"
 MODEL = "jev-latest"
 
 LUNA, SOL, ASTRA = "gpt-5.6-luna", "gpt-5.6-sol", "gpt-6-astra"
-TIERS = (LUNA, SOL, ASTRA)
+DEEPSEEK = "opencode-go/deepseek-v4.1-flash"
+FALLBACK_NATIVE = SOL
+DEEPSEEK_PREFIX = "opencode-go/deepseek-"
+MODEL_FALLBACK_EFFORTS = {
+    LUNA: ["low", "medium", "high", "xhigh", "max"],
+    SOL: ["low", "medium", "high", "xhigh", "max", "ultra"],
+    ASTRA: ["low", "medium", "high", "xhigh", "max", "ultra"],
+}
 EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 CONF_GATE = 0.5
 
 # Codex-dry tandem: used ONLY while native (ChatGPT) usage is exhausted.
 GO_STANDARD = "opencode-go/deepseek-v4.1-flash"
-GO_FRONTIER = "opencode-go/glm-5.3-flash"
+GO_FRONTIER = GO_STANDARD
 DRY_MANUAL_PATH = os.path.join(STATE, "jev-router.codex-dry")
 DRY_STATE_PATH = os.path.join(STATE, "jev-router.codex-dry.json")
 DRY_COOLDOWN_S = 30 * 60
 QUOTA_RX = re.compile(
     r"(?i)(rate[ _-]?limit|out_of_usage|usage limit|hit your usage|insufficient_quota|quota)")
+LOCAL_ROUTER_FAIL_RX = re.compile(
+    r"(?i)(could not complete the request|cost-policy\.json is missing|"
+    r"cost_policy_blocked|monthly total cost cap|payment required)")
 
 ERROR_RX = re.compile(
     r"(?i)(traceback|error|failed|exit code [1-9]|assertion|exception|fatal|panic)")
@@ -99,18 +129,21 @@ QUESTIONS = {
     "tier": {
         "type": "choice",
         "instructions": (
-            "Which model tier should serve this model call? This is one call inside an ongoing "
+            "Which configured model should serve this model call? This is one call inside an ongoing "
             "coding-agent session. When the call directly follows a tool result, route THIS next "
             "step only: mechanical continuations (running or re-running commands, applying a "
             "prepared edit, checking output, routine file reads) are fine on gpt-5.6-luna; "
             "standard next actions belong to gpt-5.6-sol; reserve gpt-6-astra for steps that need "
-            "frontier reasoning (complex debugging after failures, architecture, ambiguous or "
-            "risky changes). When the call starts a fresh user turn, route the task itself."
+                "frontier reasoning (complex debugging after failures, architecture, ambiguous or "
+                "risky changes). When the call starts a fresh user turn, route the task itself. "
+                "Choose only from the model IDs listed in the criteria. Prefer OpenAI native models "
+                "when they have allowance; use an OpenCode DeepSeek model for routine work when it "
+                "is available and clearly cheaper."
         ),
         "criteria": {
-            LUNA: "Fast and cheap; mechanical or clearly scoped tasks.",
-            SOL: "Workhorse; standard implementation work.",
-            ASTRA: "Frontier; hard, ambiguous, or risky problems.",
+            LUNA: "Fast native OpenAI model for mechanical and clearly scoped tasks.",
+            SOL: "Native OpenAI workhorse for standard implementation work.",
+            ASTRA: "Native OpenAI frontier model for hard, ambiguous, or risky problems.",
         },
     },
     "depth": {
@@ -130,6 +163,155 @@ QUESTIONS = {
         },
     },
 }
+
+
+def _model_description(slug):
+    leaf = slug.rsplit("/", 1)[-1]
+    if slug.startswith(DEEPSEEK_PREFIX):
+        return f"OpenCode DeepSeek model ({leaf}); use for routine implementation and inspection when suitable."
+    if slug == LUNA:
+        return "Native OpenAI fast model for mechanical and clearly scoped work."
+    if slug == SOL:
+        return "Native OpenAI workhorse for standard implementation and debugging."
+    if slug == ASTRA:
+        return "Native OpenAI frontier model for hard, ambiguous, or risky work."
+    return f"Configured native Codex model ({leaf}); choose when its capability fits the task."
+
+
+def load_route_catalog():
+    """Read the installed Router catalog and keep only native GPT + DeepSeek routes."""
+    data = _read_json(CATALOG_PATH) or {}
+    entries = {}
+    for item in data.get("models", []):
+        if not isinstance(item, dict):
+            continue
+        slug = item.get("slug")
+        if not isinstance(slug, str) or slug == "gpt-reserve":
+            continue
+        if not (slug.startswith("gpt-") or slug.startswith(DEEPSEEK_PREFIX)):
+            continue
+        efforts = [
+            level.get("effort") for level in item.get("supported_reasoning_levels", [])
+            if isinstance(level, dict) and level.get("effort") in EFFORTS
+        ]
+        entries[slug] = {
+            "efforts": efforts or MODEL_FALLBACK_EFFORTS.get(slug, ["medium"]),
+            "description": _model_description(slug),
+        }
+    for slug, efforts in MODEL_FALLBACK_EFFORTS.items():
+        entries.setdefault(slug, {"efforts": efforts, "description": _model_description(slug)})
+    entries.setdefault(GO_STANDARD, {"efforts": ["low", "high", "max"], "description": _model_description(GO_STANDARD)})
+    return entries
+
+
+def questions_for_catalog(catalog):
+    questions = dict(QUESTIONS)
+    model_question = dict(questions["tier"])
+    model_question["criteria"] = {
+        slug: item["description"] for slug, item in sorted(catalog.items())
+    }
+    questions["tier"] = model_question
+    return questions
+
+
+def aging_snapshot():
+    data = _read_json(AGING_PATH) or {}
+    stats = data.get("stats") if isinstance(data.get("stats"), dict) else {}
+    if not stats:
+        evaluated = requests = aged = saved = largest = 0
+        try:
+            with open(USAGE_EVENTS_PATH, encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        continue
+                    if "toolResultsEvaluated" in event:
+                        evaluated += 1
+                    bytes_saved = int(event.get("toolResultBytesSaved", 0) or 0)
+                    if bytes_saved > 0:
+                        requests += 1
+                        aged += int(event.get("toolResultsAged", 0) or 0)
+                        saved += bytes_saved
+                        largest = max(largest, int(event.get("toolResultBytesLargest", 0) or 0))
+        except OSError:
+            pass
+        stats = {
+            "requests": requests,
+            "evaluatedRequests": evaluated,
+            "resultsAged": aged,
+            "bytesSaved": saved,
+            "estimatedTokensSaved": round(saved / 4),
+            "largestResultBytes": largest,
+        }
+    return {
+        "enabled": bool(data.get("enabled", False)),
+        "nativeEnabled": bool(data.get("nativeEnabled", False)),
+        "retentionTtlDays": data.get("retentionTtlDays"),
+        "requests": int(stats.get("requests", 0) or 0),
+        "evaluatedRequests": int(stats.get("evaluatedRequests", 0) or 0),
+        "resultsAged": int(stats.get("resultsAged", 0) or 0),
+        "bytesSaved": int(stats.get("bytesSaved", 0) or 0),
+        "estimatedTokensSaved": int(stats.get("estimatedTokensSaved", 0) or 0),
+    }
+
+
+def execution_policy_snapshot():
+    """Expose the browser execution boundary without coupling tools to routing."""
+    driver = shutil.which("cua-driver")
+    if not driver:
+        for candidate in (
+            os.path.join(HOME, ".local", "bin", "cua-driver"),
+            "/opt/homebrew/bin/cua-driver",
+            "/usr/local/bin/cua-driver",
+        ):
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                driver = candidate
+                break
+    return {
+        "browser": {
+            "default": "cua-driver",
+            "driverInstalled": bool(driver),
+            "driverPath": driver or None,
+            "structuredFastPath": "opt-in jev-ultrafast",
+            "modelRoutingSeparate": True,
+        }
+    }
+
+
+def guidance_snapshot():
+    """Read-only view of the persistent AGENTS/SKILL maintenance service."""
+    status = _read_json(GUIDANCE_STATUS_PATH) or {}
+    config = _read_json(GUIDANCE_CONFIG_PATH) or {}
+    repositories = status.get("repositories")
+    pending = 0
+    if isinstance(repositories, list):
+        pending = sum(
+            1 for item in repositories
+            if isinstance(item, dict) and item.get("action") == "would_create_pr"
+        )
+    return {
+        "configured": bool(config.get("repositories") or config.get("roots")),
+        "intervalSeconds": int(config.get("intervalSeconds", 0) or 0),
+        "lastRun": status.get("completedAt"),
+        "dryRun": bool(status.get("dryRun", False)),
+        "repositoryCount": len(repositories) if isinstance(repositories, list) else 0,
+        "pendingChanges": pending,
+        "service": "instruction-sync",
+    }
+
+
+def session_identity(payload):
+    """Find a stable session hint without persisting its value or prompt text."""
+    metadata = payload.get("metadata")
+    candidates = []
+    if isinstance(metadata, dict):
+        candidates.extend(metadata.get(key) for key in ("thread_id", "session_id", "conversation_id"))
+    candidates.extend(payload.get(key) for key in ("prompt_cache_key", "safety_identifier", "conversation_id"))
+    for value in candidates:
+        if isinstance(value, (str, int)) and str(value).strip():
+            return str(value).strip()
+    return None
 
 _log_lock = threading.Lock()
 
@@ -200,15 +382,40 @@ def clear_native_dry():
         pass
 
 
+def is_native_model(model):
+    return isinstance(model, str) and model.startswith("gpt-") and model != "gpt-reserve"
+
+
 def dry_target(native_model, effort):
-    """Codex-dry tandem: frontier-tier steps -> GLM, everything else -> deepseek."""
-    if native_model == ASTRA:
-        return GO_FRONTIER, effort or "high"
-    return GO_STANDARD, effort or "medium"
+    """Codex-dry fallback for any native model; DeepSeek remains the user's external tier."""
+    return GO_FRONTIER, effort or "medium"
 
 
-def call_jev(key, state, timeout=4.0):
-    body = json.dumps({"model": MODEL, "state": state, "questions": QUESTIONS}).encode()
+def local_router_retryable(status, body_text=""):
+    """Classify a local Codex Router failure that hive should fail-open on.
+
+    402 cost-cap and overlay 502s are not model bugs. Retry Luna, then the
+    tandem, instead of returning the gateway error to Code X.
+    """
+    code = int(status or 0)
+    text = body_text or ""
+    lowered = text.lower()
+    if code == 429 or QUOTA_RX.search(text):
+        return "quota"
+    if (
+        code == 402
+        or "monthly total cost cap" in lowered
+        or "cost_policy_blocked" in lowered
+        or "payment required" in lowered
+    ):
+        return "cost_cap"
+    if code in (502, 503) or LOCAL_ROUTER_FAIL_RX.search(text):
+        return "gateway"
+    return None
+
+
+def call_jev(key, state, questions, timeout=4.0):
+    body = json.dumps({"model": MODEL, "state": state, "questions": questions}).encode()
     req = urllib.request.Request(
         API,
         data=body,
@@ -219,11 +426,43 @@ def call_jev(key, state, timeout=4.0):
         return json.loads(resp.read().decode("utf-8"))
 
 
-def clamp_effort(depth):
-    return depth if depth in EFFORTS else "medium"
+def build_jev_state(task, prev_assistant, signals, step, catalog,
+                    current_dry_reason, cache_token):
+    """Build the bounded advisor packet without forwarding conversation history."""
+    state = {
+        "task": (task or "")[:500],
+        "signals": signals,
+        "step": {"type": step.get("step_type", "other")},
+        "routing_context": hive_decision_context(catalog),
+        "runtime_constraints": {
+            "nativeDry": bool(current_dry_reason),
+            "dryReason": current_dry_reason,
+            "deepseekReplayAvailable": bool(step.get("deepseek_replay")),
+            "phaseCacheable": bool(cache_token),
+        },
+    }
+    if prev_assistant:
+        state["previous_assistant"] = prev_assistant[-240:]
+    if step.get("step_type") == "tool_step":
+        state["step"]["last_tool_output_tail"] = step.get("digest", "")[-DIGEST_CHARS:]
+        state["step"]["contains_error"] = bool(step.get("errored"))
+    return state
 
 
-def route(tier, depth, conf, step=None):
+def clamp_effort(depth, model, catalog):
+    supported = catalog.get(model, {}).get("efforts") or MODEL_FALLBACK_EFFORTS.get(model, EFFORTS)
+    if depth in supported:
+        return depth
+    # Prefer the nearest supported level without silently under-reasoning.
+    requested = EFFORTS.index(depth) if depth in EFFORTS else EFFORTS.index("medium")
+    ranked = sorted(
+        ((abs(EFFORTS.index(level) - requested), EFFORTS.index(level), level) for level in supported if level in EFFORTS),
+        key=lambda item: (item[0], -item[1]),
+    )
+    return ranked[0][2] if ranked else "medium"
+
+
+def route(tier, depth, conf, step=None, catalog=None):
     """Apply the routing policy. Returns (model, effort, speed, gate).
 
     Below the confidence gate the middle tier is the safe default, with one
@@ -232,23 +471,38 @@ def route(tier, depth, conf, step=None):
     tier's stated job, and luna runs on the priority fast lane at ~1/10th of
     sol's rates.
     """
+    catalog = catalog or load_route_catalog()
+    chosen = tier if tier in catalog else None
+    if not chosen:
+        chosen = FALLBACK_NATIVE if FALLBACK_NATIVE in catalog else next(iter(catalog), LUNA)
+    if chosen == ASTRA and (conf is None or conf < 0.75):
+        # Astra is reserved for a high-confidence consequential decision.
+        # Jev's low-confidence frontier picks are cheaper and safer on Sol.
+        chosen = SOL if SOL in catalog else LUNA
+        return chosen, clamp_effort(depth or "high", chosen, catalog), "default", "hold(sol_frontier)"
     if conf is not None and conf < CONF_GATE:
         # Backtest finding: falling back to astra ate ~80% of the savings;
         # the middle tier keeps the anti-downgrade property without burning the frontier.
         if (
-            tier == LUNA
+            chosen == LUNA
             and isinstance(step, dict)
             and step.get("step_type") == "tool_step"
             and not step.get("errored")
             and (depth or "low") in ("low", "medium")
         ):
-            return LUNA, "max", "priority", "hold(luna_step)"
-        return SOL, clamp_effort(depth), "default", "hold(sol)"
-    if tier == LUNA:
-        return LUNA, "max", "priority", "apply"
-    if tier == SOL:
-        return SOL, clamp_effort(depth), "default", "apply"
-    return ASTRA, clamp_effort(depth), "default", "apply"
+            return LUNA, clamp_effort(depth, LUNA, catalog), "priority", "hold(luna_step)"
+        # Low-confidence routine turns should stay on the cheap lane. Sol
+        # remains the uncertainty fallback for high-depth or clearly advanced
+        # work, while low/medium steps use Luna to avoid spending Sol merely
+        # because Jev was unsure between inexpensive candidates.
+        routine_depth = (depth or "low") in ("low", "medium")
+        routine_choice = chosen == LUNA or chosen.startswith(DEEPSEEK_PREFIX)
+        preferred_fallback = LUNA if routine_depth or routine_choice else FALLBACK_NATIVE
+        fallback = preferred_fallback if preferred_fallback in catalog else chosen
+        gate_name = "hold(luna)" if fallback == LUNA else "hold(sol)"
+        return fallback, clamp_effort(depth, fallback, catalog), "default", gate_name
+    speed = "priority" if chosen == LUNA else "default"
+    return chosen, clamp_effort(depth, chosen, catalog), speed, "apply"
 
 
 def _content_text(content):
@@ -270,13 +524,19 @@ def extract(payload):
     inp = payload.get("input")
     last_user = last_assistant = ""
     n_items = 0
+    context_chars = 0
     has_image = False
     tool_tail = False
     if isinstance(inp, str):
         last_user = inp
         n_items = 1
+        context_chars = len(inp)
     elif isinstance(inp, list):
         n_items = len(inp)
+        try:
+            context_chars = len(json.dumps(inp, ensure_ascii=False, separators=(",", ":")))
+        except (TypeError, ValueError):
+            context_chars = 0
         tail = inp[-6:]
         for item in tail:
             if isinstance(item, dict) and item.get("type") == "function_call_output":
@@ -299,6 +559,8 @@ def extract(payload):
         "n_items": n_items,
         "has_image": has_image,
         "tool_history": tool_tail,
+        "context_items": n_items,
+        "context_chars": context_chars,
     }
 
 
@@ -337,6 +599,21 @@ def classify(payload):
     if not isinstance(inp, list):
         return detail
     detail["n_items"] = len(inp)
+    detail["has_reasoning"] = any(
+        isinstance(item, dict) and item.get("type") == "reasoning"
+        for item in inp
+    )
+    # OpenCode's DeepSeek thinking adapter needs the previous assistant
+    # message's Chat Completions-style reasoning_content. Codex Responses
+    # history normally carries an encrypted reasoning item instead, which is
+    # not replayable by that adapter and produces a provider 400.
+    detail["deepseek_replay"] = any(
+        isinstance(item, dict)
+        and item.get("role") == "assistant"
+        and isinstance(item.get("reasoning_content"), str)
+        and bool(item.get("reasoning_content").strip())
+        for item in inp
+    )
     last = inp[-1] if inp else None
     if isinstance(last, dict):
         ltype = last.get("type")
@@ -643,6 +920,15 @@ class Handler(BaseHTTPRequestHandler):
             })
         elif path in ("/health", ""):
             self._json(200, {"ok": True, "service": "jev-router", "version": VERSION})
+        elif path in ("/hive", "/hive/status"):
+            status = hive_snapshot()
+            status["jevCache"] = hive_cache_snapshot()
+            status["logistic"] = hive_logistic_snapshot()
+            status["toolResultAging"] = aging_snapshot()
+            status["maintenance"] = hive_maintenance_snapshot()
+            status["executionPolicy"] = execution_policy_snapshot()
+            status["guidance"] = guidance_snapshot()
+            self._json(200, status)
         else:
             self._json(404, {"error": {"message": "not found"}})
 
@@ -683,42 +969,107 @@ class Handler(BaseHTTPRequestHandler):
                 pass
         task, prev_assistant, signals = extract(payload)
         step = classify(payload)
+        step.update(signals)
         stream_requested = payload.get("stream") is True
+        catalog = load_route_catalog()
+        questions = questions_for_catalog(catalog)
+        cache_token = None
+        if step["step_type"] in ("user_turn", "other") and task:
+            cache_token = hive_cache_key(session_identity(payload), task, step)
 
         tier = depth = conf = None
         jev_ms = None
+        hive_decision = None
+        cache_hit = False
+        compaction_advised = False
+        current_dry_reason = native_dry()
         if os.path.exists(OFF_PATH):
             model, effort, speed, gate = ASTRA, None, None, "off"
         elif task.lstrip().startswith("You are creating a lossy continuation checkpoint"):
-            # Quality first: the checkpoint defines the continuation context, so
-            # compaction calls are pinned instead of left to the per-call judge.
+            # Deterministic aging runs first in the local Router. Only a
+            # checkpoint that remains large asks Jev for bounded advice; the
+            # checkpoint itself stays on Sol unless Jev explicitly calls for
+            # more depth.
             model, effort, speed, gate = SOL, "high", "default", "compaction"
-        else:
-            key = load_key()
-            if key and task:
+            severe = signals.get("context_chars", 0) >= 450000 or signals.get("context_items", 0) >= 300
+            aging = aging_snapshot()
+            key = load_key() if aging["enabled"] and severe else ""
+            if key:
                 jt0 = time.time()
-                state = {"task": task[:500], "signals": signals,
-                         "step": {"type": step["step_type"]}}
-                if prev_assistant:
-                    state["previous_assistant"] = prev_assistant[-240:]
-                if step["step_type"] == "tool_step":
-                    state["step"]["last_tool_output_tail"] = step["digest"]
-                    state["step"]["contains_error"] = step["errored"]
                 try:
-                    answer = (call_jev(key, state).get("answers") or {})
-                    tier_ans = answer.get("tier") or {}
-                    tier = tier_ans.get("choice") if tier_ans.get("choice") in TIERS else None
-                    conf = tier_ans.get("confidence")
-                    if not isinstance(conf, (int, float)):
-                        conf = None
-                    depth_ans = answer.get("depth") or {}
-                    depth = depth_ans.get("choice")
-                    model, effort, speed, gate = route(tier, depth, conf, step)
-                except Exception as exc:
-                    model, effort, speed, gate = ASTRA, "medium", "default", f"jev_error:{type(exc).__name__}"
+                    answer = (call_jev(
+                        key,
+                        {"task": task[:500], "signals": signals, "step": {"type": "compaction_after_aging"}},
+                        questions,
+                    ).get("answers") or {})
+                    depth_answer = answer.get("depth") or {}
+                    advised_depth = depth_answer.get("choice")
+                    effort = clamp_effort(advised_depth or "high", SOL, catalog)
+                    gate = "compaction:jev_advisor"
+                    compaction_advised = True
+                except Exception:
+                    gate = "compaction:jev_unavailable"
                 jev_ms = int((time.time() - jt0) * 1000)
+        else:
+            hive_decision = hive_classify(task, step, catalog)
+            if hive_decision:
+                hive_decision = hive_enrich_decision(
+                    hive_decision, step, signals, bool(cache_token)
+                )
+                model = hive_decision["model"]
+                effort = hive_decision["effort"]
+                speed = "priority" if model == LUNA else "default"
+                gate = f"hive:{hive_decision['route_class']}"
+                conf = hive_decision.get("confidence")
             else:
-                model, effort, speed, gate = ASTRA, "medium", "default", "no_key_or_task"
+                cached_route = hive_cache_get(cache_token, catalog)
+                if cached_route:
+                    tier = cached_route.get("tier")
+                    depth = cached_route.get("depth")
+                    conf = cached_route.get("conf")
+                    model = cached_route["model"]
+                    effort = cached_route.get("effort") or "medium"
+                    speed = cached_route.get("speed")
+                    gate = "cache:phase"
+                    cache_hit = True
+                else:
+                    key = load_key()
+                if not cached_route and key and task:
+                    jt0 = time.time()
+                    state = build_jev_state(
+                        task, prev_assistant, signals, step, catalog,
+                        current_dry_reason, cache_token,
+                    )
+                    try:
+                        answer = (call_jev(key, state, questions).get("answers") or {})
+                        tier_ans = answer.get("tier") or {}
+                        tier = tier_ans.get("choice") if tier_ans.get("choice") in catalog else None
+                        conf = tier_ans.get("confidence")
+                        if not isinstance(conf, (int, float)):
+                            conf = None
+                        depth_ans = answer.get("depth") or {}
+                        depth = depth_ans.get("choice")
+                        model, effort, speed, gate = route(tier, depth, conf, step, catalog)
+                        jev_decision = hive_enrich_decision({
+                            "route_class": step.get("step_type", "other"),
+                            "model": model,
+                            "effort": effort,
+                            "confidence": conf,
+                            "reason": "jev_decision",
+                        }, step, signals, bool(cache_token))
+                        hive_cache_put(cache_token, {
+                            "tier": tier,
+                            "depth": depth,
+                            "conf": conf,
+                            "model": model,
+                            "effort": effort,
+                            "speed": speed,
+                        })
+                    except Exception as exc:
+                        model, effort, speed, gate = ASTRA, "medium", "default", f"jev_error:{type(exc).__name__}"
+                    jev_ms = int((time.time() - jt0) * 1000)
+                elif not cached_route:
+                    model, effort, speed, gate = ASTRA, "medium", "default", "no_key_or_task"
 
         would = None
         if os.path.exists(SHADOW_PATH):
@@ -728,9 +1079,9 @@ class Handler(BaseHTTPRequestHandler):
         # Codex-dry tandem: ONLY while native usage is exhausted (manual flag or
         # observed quota failure) the triptych is replaced — GLM for frontier
         # steps, deepseek for the rest. Otherwise luna/sol/astra run untouched.
-        dry_reason = native_dry()
+        dry_reason = current_dry_reason
         native_model = model
-        if dry_reason and model in TIERS:
+        if dry_reason and is_native_model(model):
             model, effort = dry_target(native_model, effort)
             speed = None
             gate = f"codex_dry({dry_reason}):{native_model}"
@@ -755,24 +1106,70 @@ class Handler(BaseHTTPRequestHandler):
         apply_route(payload, model, effort, speed)
 
         out_path = path if path.startswith("/v1") else "/v1" + path
-        status, out_kind, ctype, quota_hit = self._forward(
+        status, out_kind, ctype, retry_reason, pending = self._forward(
             payload, out_path, stream_requested, debug, marker, model)
+        if cache_hit and status != 200:
+            hive_cache_invalidate(cache_token)
+        observed_decision = hive_decision or locals().get("jev_decision")
+        if observed_decision is None:
+            observed_decision = hive_enrich_decision({
+                "route_class": "recovery" if step.get("errored") else step.get("step_type", "other"),
+                "model": model,
+                "effort": effort,
+                "confidence": conf,
+                "reason": gate,
+            }, step, signals, bool(cache_token))
+        hive_record_outcome(observed_decision, status)
         retried = False
-        if quota_hit and not dry_reason:
-            # Native usage is exhausted: flip to the Go tandem and retry this very
-            # call so the turn does not fail (nothing reached the client yet).
-            mark_native_dry("quota")
+        if (
+            status != 200
+            and model != LUNA
+            and LUNA in catalog
+            and (retry_reason or model == DEEPSEEK)
+        ):
+            # Hive's cheap route, or a local-router 402/502, must not kill the
+            # turn. Retry native Luna on the ChatGPT subscription first.
+            fallback_decision = dict(hive_decision or observed_decision or {})
+            fallback_decision.update({
+                "model": LUNA,
+                "reason": f"hive_fallback_{retry_reason or status}",
+            })
+            fallback_decision = hive_enrich_decision(
+                fallback_decision, step, signals, bool(cache_token)
+            )
+            model, effort, speed = LUNA, "medium", "priority"
+            gate = f"hive:fallback(luna:{retry_reason or status})"
+            marker = route_marker(model, effort)
+            apply_route(payload, model, effort, speed)
+            status, out_kind, ctype, retry_reason, pending = self._forward(
+                payload, out_path, stream_requested, debug, marker, model)
+            hive_record_outcome(fallback_decision, status)
+            retried = True
+        if retry_reason and not dry_reason:
+            # Native usage or the local overlay is exhausted: flip to the
+            # tandem and retry this very call so the turn does not fail.
+            mark_native_dry(retry_reason)
             model, effort = dry_target(native_model, effort)
             apply_route(payload, model, effort, None)
             retried = True
-            gate = f"codex_dry(retry):{native_model}"
+            gate = f"codex_dry(retry:{retry_reason}):{native_model}"
             marker = route_marker(model, effort)
-            status, out_kind, ctype, _ = self._forward(
+            status, out_kind, ctype, _, pending = self._forward(
                 payload, out_path, stream_requested, debug, marker, model)
-        elif status == 200 and not dry_reason and model in TIERS and os.path.exists(DRY_STATE_PATH):
+        elif status == 200 and not dry_reason and is_native_model(model) and os.path.exists(DRY_STATE_PATH):
             # Native answered again: drop the stale auto state (never the flag).
             clear_native_dry()
             dry_reason = "cleared"
+
+        # Non-stream responses are held by _forward until all provider retries
+        # are complete. Send only the final attempt to the caller.
+        if pending is not None:
+            pending_ctype, pending_data = pending
+            self.send_response(status)
+            self.send_header("Content-Type", pending_ctype or "application/json")
+            self.send_header("Content-Length", str(len(pending_data)))
+            self.end_headers()
+            self.wfile.write(pending_data)
 
         log_line({
             "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -786,6 +1183,8 @@ class Handler(BaseHTTPRequestHandler):
             "native": native_model,
             "dry": dry_reason,
             "retried": retried,
+            "cacheHit": cache_hit,
+            "compactionAdvised": compaction_advised,
             "jev_ms": jev_ms,
             "total_ms": int((time.time() - t0) * 1000),
             "status": status,
@@ -797,17 +1196,22 @@ class Handler(BaseHTTPRequestHandler):
             "step": step["step_type"],
             "errored": step["errored"],
             "digest_len": len(step["digest"]),
+            "context_chars": signals.get("context_chars"),
+            "context_items": signals.get("context_items"),
             "would": would,
+            "hive": hive_decision,
             "task": task[:110],
         })
 
     def _forward(self, payload, out_path, stream_requested, debug, marker, model):
         """One relay attempt to the local caller edge, streamed straight back.
 
-        Returns (status, out_kind, ctype, quota_hit). ``quota_hit`` is True only
-        for a >=400 response whose body looks like exhausted native usage; in
-        that case nothing has been written to the client yet, so the caller can
-        retry the same payload on another model.
+        Returns (status, out_kind, ctype, retry_reason, pending).
+        ``retry_reason`` is set for quota, cost-cap, and local-gateway failures
+        so the caller can fail-open onto Luna or the tandem before any bytes
+        reach Code X. ``pending`` is the buffered non-SSE response as
+        ``(content_type, bytes)``; streamed responses are sent directly and
+        return ``None``.
         """
         body = json.dumps(payload).encode("utf-8")
         conn = http.client.HTTPConnection(*ROUTER, timeout=900)
@@ -872,8 +1276,10 @@ class Handler(BaseHTTPRequestHandler):
                 data = resp.read()
                 out_ctype = ctype or "application/json"
                 head = data[:64].lstrip()
-                if status >= 400 and (status == 429 or QUOTA_RX.search(data.decode("utf-8", "replace"))):
-                    return status, out_kind, ctype, True
+                retry_reason = local_router_retryable(
+                    status, data.decode("utf-8", "replace"))
+                if status >= 400 and retry_reason:
+                    return status, out_kind, ctype, retry_reason, (out_ctype, data)
                 # The caller edge always streams; rebuild a proper single JSON
                 # object for non-stream callers (compactions, litellm's
                 # non-stream provider path) instead of forwarding raw SSE bytes.
@@ -882,17 +1288,24 @@ class Handler(BaseHTTPRequestHandler):
                     if assembled is not None:
                         data = json.dumps(assembled).encode("utf-8")
                         out_ctype = "application/json"
-                self.send_response(status)
-                self.send_header("Content-Type", out_ctype)
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-            return status, out_kind, ctype, False
+                return status, out_kind, ctype, False, (out_ctype, data)
+            return status, out_kind, ctype, False, None
         finally:
             conn.close()
 
 
 def main():
+    hive_maintenance(force=True)
+
+    def maintenance_loop():
+        while True:
+            time.sleep(3600)
+            try:
+                hive_maintenance()
+            except Exception:
+                pass
+
+    threading.Thread(target=maintenance_loop, name="hive-maintenance", daemon=True).start()
     server = ThreadingHTTPServer(LISTEN, Handler)
     server.daemon_threads = True
     try:

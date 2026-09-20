@@ -186,6 +186,7 @@ stops answering.
 | Kill switch (no Jev → frontier) | `touch ~/.codex/codex-router/jev-router.off` (delete the file to re-enable) |
 | Force the Codex-dry tandem | `touch ~/.codex/codex-router/jev-router.codex-dry` (delete the file to return to luna/sol/astra) |
 | Inspect the dry auto state | `cat ~/.codex/codex-router/jev-router.codex-dry.json` (reason + expiry; auto-cleared by the next successful native call) |
+| Hive classifier status | `curl -s http://127.0.0.1:4319/hive/status` |
 | Hide the model | `./bin/control picker set jev/auto hide` |
 | Disable the provider | `./bin/codex-router providers generic disable jev` |
 | Revoke native sharing | `./bin/codex-router chatgpt-session disable` |
@@ -198,6 +199,63 @@ stops answering.
 cat ~/.codex/codex-router/model-picker.json      # jev/auto in "visible"
 curl -s http://127.0.0.1:4319/health
 ```
+
+### Persistent Hive calibration
+
+The local Hive classifier records only route outcome metadata in
+`~/.codex/codex-router/hive-events.jsonl`. At service startup and once per
+hour, it rebuilds a rolling 30-day policy in
+`~/.codex/codex-router/hive-policy.json`. The policy includes per-model and
+per-route-class success rates and recommendations for the dashboard. DeepSeek
+is promoted below Luna only after at least eight observations for that class
+and a 90% success rate; quarantine and failure safeguards still apply.
+
+The launchd service is configured with `RunAtLoad` and `KeepAlive`, so a laptop
+restart starts the router again and immediately refreshes the policy. No
+manual retraining command is required. `/hive/status` exposes the last update,
+next scheduled update, event count, and current recommendations without
+including prompts or tool output.
+
+### Logistic shadow calibration
+
+The router also maintains a small persisted online logistic scorer in
+`~/.codex/codex-router/hive-logistic.json`. It learns from transport outcomes
+using bounded metadata such as route class, model, effort, context size,
+provider compatibility and whether the request was a continuation. It runs in
+shadow mode and reports its probability, sample count, log loss and readiness
+through `/hive/status`; it cannot change routing by itself.
+
+This separation is intentional. Hive and Jev remain the active decision
+policy until the candidate has enough labeled evidence to beat the current
+policy on held-out recent traffic. HTTP success is currently recorded as a
+transport label, not proof that the task was semantically correct. Future
+quality feedback can add accepted, corrected, retried and escalated labels
+before the logistic candidate is allowed to influence low-risk routing.
+
+### Browser execution boundary
+
+Model routing and computer control are separate decisions. Native browser and
+desktop actions use the installed Cua Driver, which provides exact window and
+accessibility targeting plus independent verification. The `jev-ultrafast`
+path is an opt-in optimization for structured, indexed browser controls only;
+it does not replace Cua Driver for arbitrary clicks, uploads, downloads,
+dialogs, or native applications. Jev chooses a model for the reasoning turn,
+while Cua Driver executes the browser action.
+
+The live `/hive/status` response reports whether `cua-driver` is installed and
+the active execution policy, so browser failures are not mistaken for model
+routing failures.
+
+### Project guidance maintenance
+
+The router does not silently rewrite repository instructions. The
+`instruction-sync` service is the durable owner for AGENTS.md and project
+skill updates. It runs from launchd, survives laptop restarts, and records a
+reviewable branch and PR plan for configured repositories. Keep it in dry-run
+mode until proposed guidance changes have been reviewed; the Jev status
+endpoint reports its interval, last run, and pending changes. When a project
+needs a new workflow, add a bounded skill with Codex skill tooling, then let
+instruction-sync propose the repository change.
 
 ## Notes & quirks
 

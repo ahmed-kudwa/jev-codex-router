@@ -29,6 +29,11 @@ All traffic stays on loopback; the design is fail-open; there is a kill switch.
    the restriction.
 5. Treat prompt excerpts in local logs (`jev-router-live.jsonl`,
    `shadow-log.jsonl`) as private user data: read locally, never republish.
+6. Keep model routing separate from browser execution. Use the installed Cua
+   Driver for native browser and desktop actions. Use `jev-ultrafast` only as
+   an explicit opt-in for structured indexed controls that it can verify.
+   Never route arbitrary clicks, uploads, downloads, dialogs, or native app
+   control through the model-selection layer.
 
 ## Prerequisites (check, and report what you found)
 
