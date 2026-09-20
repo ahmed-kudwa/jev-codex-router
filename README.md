@@ -232,6 +232,23 @@ transport label, not proof that the task was semantically correct. Future
 quality feedback can add accepted, corrected, retried and escalated labels
 before the logistic candidate is allowed to influence low-risk routing.
 
+### Optional Jev-align policy improvement
+
+The router includes an offline exporter for
+[jev-align](https://github.com/sutro-sh/jev-align). It creates a bounded,
+redacted CSV from local routing traces so ambiguous route classes and effort
+levels can be human-labeled and evaluated with GEPA. It never runs in the
+request path and never applies a proposal automatically:
+
+```bash
+python3 scripts/jev_align_export.py
+```
+
+See [docs/JEV-ALIGN.md](docs/JEV-ALIGN.md) for validation, labeling, held-out
+evaluation, and promotion gates. The upstream project is alpha software and
+currently has an MIT/Apache metadata mismatch; this repository uses it as an
+optional external tool and does not vendor its code.
+
 ### Browser execution boundary
 
 Model routing and computer control are separate decisions. Native browser and

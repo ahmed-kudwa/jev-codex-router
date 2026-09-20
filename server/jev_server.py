@@ -55,6 +55,8 @@ import json
 import os
 import re
 import shutil
+import subprocess
+import sys
 import threading
 import time
 import urllib.request
@@ -82,6 +84,10 @@ AGING_PATH = os.path.join(STATE, "tool-result-aging.json")
 USAGE_EVENTS_PATH = os.path.join(STATE, "usage-events.jsonl")
 GUIDANCE_STATUS_PATH = os.path.join(HOME, ".codex", "instruction-sync", "status.json")
 GUIDANCE_CONFIG_PATH = os.path.join(HOME, ".codex", "instruction-sync", "config.json")
+ALIGNMENT_DATASET_PATH = os.path.join(STATE, "jev-align", "routing-dataset.csv")
+ALIGNMENT_EXPORT_SCRIPT = os.path.join(
+    os.path.dirname(__file__), "..", "scripts", "jev_align_export.py"
+)
 CALLER_SECRET_PATH = os.path.join(STATE, "caller-secret")
 OFF_PATH = os.path.join(STATE, "jev-router.off")
 SHADOW_PATH = os.path.join(STATE, "jev-router.shadow")
@@ -254,6 +260,47 @@ def aging_snapshot():
         "bytesSaved": int(stats.get("bytesSaved", 0) or 0),
         "estimatedTokensSaved": int(stats.get("estimatedTokensSaved", 0) or 0),
     }
+
+
+def alignment_snapshot():
+    """Expose offline Jev-align readiness without reading prompts or calling a model."""
+    result = {
+        "enabled": True,
+        "mode": "offline_human_labeling",
+        "datasetPath": ALIGNMENT_DATASET_PATH,
+        "datasetExists": False,
+        "datasetBytes": 0,
+        "datasetRows": 0,
+        "datasetUpdatedAt": None,
+    }
+    try:
+        stat = os.stat(ALIGNMENT_DATASET_PATH)
+        result["datasetExists"] = True
+        result["datasetBytes"] = int(stat.st_size)
+        result["datasetUpdatedAt"] = int(stat.st_mtime)
+        with open(ALIGNMENT_DATASET_PATH, encoding="utf-8") as handle:
+            result["datasetRows"] = max(0, sum(1 for _ in handle) - 1)
+    except OSError:
+        pass
+    return result
+
+
+def refresh_alignment_dataset():
+    """Refresh the offline dataset on maintenance ticks, never per request."""
+    if not os.path.isfile(ALIGNMENT_EXPORT_SCRIPT):
+        return False
+    try:
+        completed = subprocess.run(
+            [sys.executable, ALIGNMENT_EXPORT_SCRIPT, "--limit", "5000"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=15,
+        )
+        return completed.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def execution_policy_snapshot():
@@ -926,6 +973,7 @@ class Handler(BaseHTTPRequestHandler):
             status["logistic"] = hive_logistic_snapshot()
             status["toolResultAging"] = aging_snapshot()
             status["maintenance"] = hive_maintenance_snapshot()
+            status["alignment"] = alignment_snapshot()
             status["executionPolicy"] = execution_policy_snapshot()
             status["guidance"] = guidance_snapshot()
             self._json(200, status)
@@ -1296,12 +1344,14 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     hive_maintenance(force=True)
+    refresh_alignment_dataset()
 
     def maintenance_loop():
         while True:
             time.sleep(3600)
             try:
                 hive_maintenance()
+                refresh_alignment_dataset()
             except Exception:
                 pass
 
